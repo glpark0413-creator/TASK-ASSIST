@@ -772,8 +772,11 @@ def _parse_notion_page(page: dict) -> dict:
 
     status = ""
     for name, prop in props.items():
-        if name.lower() in ("상태", "status") and prop.get("type") in ("status", "select"):
-            ptype = prop["type"]
+        ptype = prop.get("type", "")
+        if ptype == "checkbox":
+            status = "완료" if prop.get("checkbox") else ""
+            break
+        if name.lower() in ("상태", "status") and ptype in ("status", "select"):
             status = (prop.get(ptype) or {}).get("name", "")
             break
 

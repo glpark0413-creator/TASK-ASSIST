@@ -41,10 +41,14 @@ def get_page(page_id: str) -> dict:
 
 
 def detect_status_property(properties: dict) -> tuple[str | None, str]:
-    """상태 속성명과 타입 반환 (name, type)"""
+    """상태 속성명과 타입 반환 (name, type). checkbox 타입도 지원."""
     for candidate in STATUS_PROP_CANDIDATES:
         if candidate in properties:
             return candidate, properties[candidate].get("type", "")
+    # checkbox 타입 fallback (예: '완료' 체크박스)
+    for name, prop in properties.items():
+        if prop.get("type") == "checkbox":
+            return name, "checkbox"
     return None, ""
 
 
@@ -72,6 +76,8 @@ def complete_task(page_id: str):
         payload = {"properties": {status_prop: {"status": {"name": "완료"}}}}
     elif status_type == "select":
         payload = {"properties": {status_prop: {"select": {"name": "완료"}}}}
+    elif status_type == "checkbox":
+        payload = {"properties": {status_prop: {"checkbox": True}}}
     else:
         print(f"지원하지 않는 상태 속성 타입: {status_type}", file=sys.stderr)
         sys.exit(1)
