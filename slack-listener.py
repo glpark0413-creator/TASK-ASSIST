@@ -108,10 +108,32 @@ _LLM_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "get_today_tasks",
+            "description": (
+                "Notion TO DO LIST에서 특정 날짜의 할 일을 조회해서 보여준다. "
+                "'오늘 할 일', '내일 할 일', '6월10일 업무', '다음주 월요일 할 일', "
+                "'to-do list 가져와', '오늘 업무 리스트', '오늘 태스크 목록' 등. "
+                "날짜를 지정하지 않거나 '오늘'이면 target_date를 빈 문자열로 반환한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_date": {
+                        "type": "string",
+                        "description": "조회할 날짜 YYYY-MM-DD. 오늘이거나 날짜 미지정이면 빈 문자열.",
+                    }
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_briefing",
             "description": (
-                "다가오는 정기 업무 현황을 브리핑한다. "
-                "업무 목록 조회, 오늘/이번주 할 일, '뭐 있어', '알려줘' 등."
+                "정기 업무 패턴을 분석하여 다가오는 반복 업무를 브리핑한다. "
+                "'뭐 있어', '브리핑해줘', '이번주 뭐해', '업무 현황 알려줘' 등. "
+                "단순 TO DO LIST 조회가 아닌 패턴 분석·예측 요청일 때만 사용한다."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -122,6 +144,23 @@ _LLM_TOOLS = [
             "name": "reset_cache",
             "description": "패턴 분석 캐시를 삭제하고 재분석한다. '패턴 갱신', '다시 분석' 등.",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_bat",
+            "description": (
+                "외부 BAT 파일 또는 프로그램을 실행한다. "
+                "'멀티에이전트 실행', '서버 켜줘', 'RUN.BAT 실행', 'PM 시작' 등."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "실행 대상 키워드 (예: multi_agent)"},
+                },
+                "required": ["target"],
+            },
         },
     },
     {
@@ -141,7 +180,26 @@ _LLM_TOOLS = [
 ]
 
 
+def _quick_classify(text: str) -> tuple[str, dict] | None:
+    """LLM 호출 전 명확한 패턴을 즉시 분류 (오분류 방지)"""
+    if re.search(r"멀티.?에이전트|multi.?agent|run\.bat|PM\s*시작|서버\s*켜", text, re.IGNORECASE):
+        return "run_bat", {"target": "multi_agent"}
+    # "TO DO LIST 가져와" / "할 일 보여줘" / "내일 할 일" / "6월10일 업무" 등 → get_today_tasks
+    if (
+        re.search(r"(?:to[-\s]?do|투두|할\s*일).{0,25}(?:가져|불러|조회|보여|알려)", text, re.IGNORECASE)
+        or re.search(r"(?:오늘|내일|모레|다음\s*주).{0,20}(?:to[-\s]?do|할\s*일|투두|업무|일정).{0,20}(?:list|리스트|목록|가져|보여)?", text, re.IGNORECASE)
+        or re.search(r"\d{1,2}[월/]\d{1,2}.{0,20}(?:to[-\s]?do|할\s*일|투두|업무)", text, re.IGNORECASE)
+    ):
+        target_date = _parse_date_str(text)
+        return "get_today_tasks", {"target_date": target_date}
+    return None
+
+
 def classify_intent(text: str) -> tuple[str, dict]:
+    quick = _quick_classify(text.strip())
+    if quick:
+        print(f"  → 빠른 분류 (pre-LLM): {quick[0]}")
+        return quick
     try:
         return _llm_classify(text.strip())
     except Exception as e:
@@ -214,6 +272,8 @@ def _normalize_date(val: str) -> str:
 
 def _regex_classify(text: str) -> tuple[str, dict]:
     """폴백: 정규식 기반 분류"""
+    if re.search(r"멀티.?에이전트|multi.?agent|run\.bat|PM\s*시작|서버\s*켜", text, re.IGNORECASE):
+        return "run_bat", {"target": "multi_agent"}
     if re.search(r"패턴\s*갱신|캐시\s*삭제|다시\s*분석", text):
         return "reset_cache", {}
     if re.search(r"완료|했어|끝났어|했다|마쳤어", text):
@@ -233,6 +293,13 @@ def _regex_classify(text: str) -> tuple[str, dict]:
             "", cleaned, flags=re.IGNORECASE
         ).strip()
         return "add_task", {"task_name": cleaned, "date": _parse_date_str(text)}
+    if (
+        re.search(r"오늘.{0,15}(?:to[-\s]?do|할\s*일|투두|리스트|목록|업무|태스크)", text, re.IGNORECASE)
+        or re.search(r"(?:to[-\s]?do|투두|할\s*일).{0,15}(?:가져|불러|조회|보여|알려)", text, re.IGNORECASE)
+        or re.search(r"(?:내일|모레|다음\s*주).{0,20}(?:to[-\s]?do|할\s*일|투두|업무)", text, re.IGNORECASE)
+        or re.search(r"\d{1,2}[월/]\d{1,2}.{0,20}(?:to[-\s]?do|할\s*일|투두|업무)", text, re.IGNORECASE)
+    ):
+        return "get_today_tasks", {"target_date": _parse_date_str(text)}
     return "get_briefing", {}
 
 
@@ -476,6 +543,9 @@ def build_briefing(tasks: list[dict]) -> str:
 # user_id → {task_name, date, category_prop}
 _pending_task_add: dict[str, dict] = {}
 
+# user_id → {action, task_name, new_date}
+_pending_confirmation: dict[str, dict] = {}
+
 _NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 _NOTION_TASK_DB_ID = os.environ.get("NOTION_TASK_DB_ID", "")
 _NOTION_HEADERS = {
@@ -555,16 +625,12 @@ def workflow_briefing(say):
     say(briefing)
 
 
-def workflow_complete(say, task_name: str):
-    if not task_name:
-        say("어떤 업무를 완료하셨나요?\n예: `@봇 주간보고 완료했어`")
-        return
-
+def _do_complete(say, task_name: str):
+    """확인 없이 즉시 Notion 완료 처리"""
     page_id = find_page_id(task_name)
     if not page_id:
         say(f"'{task_name}' 업무를 Notion에서 찾지 못했습니다. 업무명을 정확히 입력해 주세요.")
         return
-
     ok, out = run_script(
         ".claude/skills/notion-connector/scripts/notion-updater.py",
         ["complete", page_id]
@@ -573,6 +639,17 @@ def workflow_complete(say, task_name: str):
         say(f"✅ '{task_name}' 완료 처리했습니다.")
     else:
         say(f"⚠️ 완료 처리 실패:\n```{out}```")
+
+
+def workflow_complete(say, task_name: str, user_id: str = ""):
+    if not task_name:
+        say("어떤 업무를 완료하셨나요?\n예: `@봇 주간보고 완료했어`")
+        return
+    if user_id:
+        _pending_confirmation[user_id] = {"action": "complete", "task_name": task_name}
+        say(f"✅ *'{task_name}'* 을(를) 완료 처리할까요?\n`@봇 네` / `@봇 아니오`")
+    else:
+        _do_complete(say, task_name)
 
 
 def workflow_calendar_add(say, task_name: str, event_date: str):
@@ -654,16 +731,180 @@ def _execute_task_add(
         say(f"⚠️ 태스크 추가 실패:\n```{out}```")
 
 
-def workflow_postpone(say, task_name: str, new_date: str):
-    if not task_name:
-        say("어떤 업무를 연기할까요?\n예: `@봇 주간보고 다음 주로 미뤄`")
+def _fetch_all_notion_tasks() -> list[dict]:
+    """Notion Task DB에서 전체 태스크 페이지 조회 (페이지네이션 포함)"""
+    results = []
+    payload: dict = {"page_size": 100}
+    url = f"https://api.notion.com/v1/databases/{_NOTION_TASK_DB_ID}/query"
+    while True:
+        try:
+            resp = requests.post(url, headers=_NOTION_HEADERS, json=payload, verify=False, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            results.extend(data.get("results", []))
+            if not data.get("has_more"):
+                break
+            payload["start_cursor"] = data["next_cursor"]
+        except Exception as e:
+            print(f"Notion 태스크 전체 조회 실패: {e}", file=sys.stderr)
+            break
+    return results
+
+
+def _parse_notion_page(page: dict) -> dict:
+    """Notion 페이지 properties에서 태스크 정보 추출"""
+    props = page.get("properties", {})
+
+    title = ""
+    for prop in props.values():
+        if prop.get("type") == "title":
+            title = "".join(t.get("plain_text", "") for t in prop.get("title", []))
+            break
+
+    task_date = None
+    task_date_end = None
+    for prop in props.values():
+        if prop.get("type") == "date" and prop.get("date"):
+            task_date = prop["date"].get("start", "")[:10]
+            raw_end = prop["date"].get("end", "")
+            task_date_end = raw_end[:10] if raw_end else None
+            break
+
+    status = ""
+    for name, prop in props.items():
+        if name.lower() in ("상태", "status") and prop.get("type") in ("status", "select"):
+            ptype = prop["type"]
+            status = (prop.get(ptype) or {}).get("name", "")
+            break
+
+    categories = []
+    for prop in props.values():
+        if prop.get("type") == "multi_select":
+            categories = [opt["name"] for opt in prop.get("multi_select", [])]
+            break
+        if prop.get("type") == "select" and prop.get("select"):
+            categories = [prop["select"]["name"]]
+            break
+
+    return {
+        "id": page["id"],
+        "title": title,
+        "date": task_date,
+        "date_end": task_date_end,
+        "status": status,
+        "categories": categories,
+    }
+
+
+_DONE_STATUSES = {"완료", "done", "completed", "closed", "archived"}
+
+
+def workflow_get_today_tasks(say, target_date: str = ""):
+    """TO DO LIST 조회 후 Slack 전송.
+    target_date 지정 시 해당 날짜 업무만, 미지정 시 완료·기한초과 제외 전체.
+    """
+    say("잠깐만요, TO DO LIST를 가져오는 중입니다... ⏳")
+
+    pages = _fetch_all_notion_tasks()
+    if not pages:
+        say("⚠️ Notion에서 태스크를 가져오지 못했습니다. 토큰과 DB ID를 확인해 주세요.")
         return
 
+    today = date.today().isoformat()
+    tasks = []
+
+    for page in pages:
+        info = _parse_notion_page(page)
+        if not info["title"]:
+            continue
+        if info["status"].lower() in _DONE_STATUSES:
+            continue
+
+        task_start = info["date"]
+        task_end = info.get("date_end")
+
+        if target_date:
+            # 특정 날짜 지정: 해당 날짜를 포함하는 업무만
+            if task_start and task_end:
+                # 날짜 범위 업무: target_date가 범위 내에 있으면 포함
+                if not (task_start <= target_date <= task_end):
+                    continue
+            elif task_start:
+                if task_start != target_date:
+                    continue
+            else:
+                # 날짜 없는 태스크는 날짜 지정 조회에서 제외
+                continue
+        else:
+            # 날짜 미지정: 기한 초과 제외
+            if task_start and task_end:
+                # 범위 업무: 종료일이 오늘 이후면 포함
+                if task_end < today:
+                    continue
+            elif task_start:
+                if task_start < today:
+                    continue
+
+        tasks.append(info)
+
+    if not tasks:
+        if target_date:
+            say(f"✅ *{target_date}에 등록된 TO DO LIST가 없습니다.*")
+        else:
+            say("✅ *현재 등록된 TO DO LIST가 없습니다.* 수고하셨습니다! 🎉")
+        return
+
+    label = target_date if target_date else f"{today} 기준"
+    lines = [f"📋 *TO DO LIST ({label}, 총 {len(tasks)}건)*\n"]
+    for t in tasks:
+        cat = f"  `{'` `'.join(t['categories'])}`" if t["categories"] else ""
+        if t.get("date_end"):
+            date_str = f" _({t['date']} ~ {t['date_end']})_"
+        elif t["date"]:
+            date_str = f" _({t['date']})_"
+        else:
+            date_str = ""
+        lines.append(f"• {t['title']}{date_str}{cat}")
+
+    say("\n".join(lines))
+
+
+BAT_TARGETS = {
+    "multi_agent": r"C:\Users\glpark0413\Desktop\업무 자동화-20260521T024618Z-3-001\업무 자동화\실 업무\Multi_agent\RUN.BAT",
+}
+
+
+def workflow_run_bat(say, target: str):
+    bat_path = BAT_TARGETS.get(target)
+    if not bat_path:
+        say(f"⚠️ 등록되지 않은 실행 대상입니다: `{target}`")
+        return
+
+    from pathlib import Path as _Path
+    if not _Path(bat_path).exists():
+        say(f"⚠️ 파일을 찾을 수 없습니다:\n`{bat_path}`")
+        return
+
+    try:
+        subprocess.Popen(
+            ["cmd", "/c", bat_path],
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+            cwd=str(_Path(bat_path).parent),
+        )
+        say(
+            "✅ *멀티에이전트 PM* 을 시작했습니다.\n"
+            "잠시 후 <http://localhost:5050|http://localhost:5050> 에서 접속하세요."
+        )
+    except Exception as e:
+        say(f"⚠️ 실행 실패: `{e}`")
+
+
+def _do_postpone(say, task_name: str, new_date: str):
+    """확인 없이 즉시 Notion 연기 처리"""
     page_id = find_page_id(task_name)
     if not page_id:
         say(f"'{task_name}' 업무를 Notion에서 찾지 못했습니다.")
         return
-
     ok, out = run_script(
         ".claude/skills/notion-connector/scripts/notion-updater.py",
         ["postpone", page_id, new_date]
@@ -672,6 +913,20 @@ def workflow_postpone(say, task_name: str, new_date: str):
         say(f"📅 '{task_name}' {new_date}로 미뤘습니다.")
     else:
         say(f"⚠️ 연기 처리 실패:\n```{out}```")
+
+
+def workflow_postpone(say, task_name: str, new_date: str, user_id: str = ""):
+    if not task_name:
+        say("어떤 업무를 연기할까요?\n예: `@봇 주간보고 다음 주로 미뤄`")
+        return
+    if user_id:
+        _pending_confirmation[user_id] = {
+            "action": "postpone", "task_name": task_name, "new_date": new_date
+        }
+        date_str = f" ({new_date})" if new_date else ""
+        say(f"📅 *'{task_name}'* 을(를){date_str}로 미룰까요?\n`@봇 네` / `@봇 아니오`")
+    else:
+        _do_postpone(say, task_name, new_date)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -700,22 +955,55 @@ def handle_mention(event, say):
         )
         return
 
+    # 완료·연기 확인 대기 중이면 현재 메시지를 확인 답변으로 처리
+    if user_id and user_id in _pending_confirmation:
+        pending = _pending_confirmation.pop(user_id)
+        print(f"  → 확인 답변 수신: '{user_text}' / pending={pending}")
+        is_yes = re.search(r"^(네|예|응|ㅇ|ok|yes|확인|맞아|맞습니다)", user_text, re.IGNORECASE)
+        is_no  = re.search(r"^(아니|아니오|취소|no|nope|ㄴ)", user_text, re.IGNORECASE)
+        if is_yes:
+            if pending["action"] == "complete":
+                _do_complete(say, pending["task_name"])
+            elif pending["action"] == "postpone":
+                _do_postpone(say, pending["task_name"], pending.get("new_date", ""))
+        elif is_no:
+            say(f"❌ *'{pending['task_name']}'* 처리를 취소했습니다.")
+        else:
+            # 관련 없는 명령 → 취소 알림 후 새 명령으로 계속 처리
+            say(
+                f"⚠️ 확인 대기 중이던 *'{pending['task_name']}'* 처리를 취소했습니다.\n"
+                "새 명령을 처리합니다..."
+            )
+            # fall-through: return 하지 않고 아래 intent 분류로 계속 진행
+            intent, info = classify_intent(user_text)
+            print(f"  → 의도(재분류): {intent} / {info}")
+            # intent 디스패치를 위해 아래 로직을 재사용하도록 goto 대신 재귀 호출
+            _dispatch_intent(say, intent, info, user_id)
+        return
+
     intent, info = classify_intent(user_text)
     print(f"  → 의도: {intent} / {info}")
+    _dispatch_intent(say, intent, info, user_id)
 
+
+def _dispatch_intent(say, intent: str, info: dict, user_id: str = ""):
+    """분류된 intent를 실제 워크플로우로 라우팅"""
     if intent == "reset_cache":
         (OUTPUT_DIR / "pattern_result.json").unlink(missing_ok=True)
         (OUTPUT_DIR / "verification_result.json").unlink(missing_ok=True)
         say("🔄 패턴 캐시를 삭제했습니다. 다시 브리핑을 요청하면 재분석합니다.")
 
+    elif intent == "get_today_tasks":
+        workflow_get_today_tasks(say, info.get("target_date", ""))
+
     elif intent == "get_briefing":
         workflow_briefing(say)
 
     elif intent == "complete_task":
-        workflow_complete(say, info.get("task_name", ""))
+        workflow_complete(say, info.get("task_name", ""), user_id)
 
     elif intent == "postpone_task":
-        workflow_postpone(say, info.get("task_name", ""), info.get("new_date", ""))
+        workflow_postpone(say, info.get("task_name", ""), info.get("new_date", ""), user_id)
 
     elif intent == "add_calendar_event":
         title = info.get("title", "")
@@ -726,6 +1014,9 @@ def handle_mention(event, say):
             say(f"'{title}'을 캘린더에 추가할 날짜를 알려주세요.")
         else:
             say("캘린더에 추가할 일정명을 알려주세요.")
+
+    elif intent == "run_bat":
+        workflow_run_bat(say, info.get("target", "multi_agent"))
 
     elif intent == "add_task":
         workflow_task_add(say, info.get("task_name", ""), info.get("date", ""), user_id)
