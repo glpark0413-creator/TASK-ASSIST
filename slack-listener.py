@@ -232,6 +232,32 @@ _LLM_TOOLS = [
 ]
 
 
+def _extract_task_name(text: str) -> str:
+    """텍스트에서 업무명 추출 (날짜·액션동사 제거)"""
+    t = text
+    # 1. 날짜 표현 제거 (공백 포함)
+    t = re.sub(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", "", t)
+    t = re.sub(r"\d{1,2}[월/]\s*\d{1,2}\s*일?\s*에?\s*", "", t)
+    t = re.sub(r"(?:오늘|내일|모레|이번\s*주|다음\s*주)\s*", "", t)
+    # 2. "to-do list에 추가해줘" 등 액션+목적지 접미어 제거 (긴 패턴 먼저)
+    t = re.sub(
+        r"\s*(?:to[-\s]?do\s*(?:list)?|투두\s*리스트?|할\s*일\s*목록)\s*에?\s*(?:추가|등록|넣어)(?:줘|주세요|해줘|해주세요)?\s*$",
+        "", t, flags=re.IGNORECASE
+    )
+    t = re.sub(
+        r"\s*(?:to[-\s]?do|투두)\s*에?\s*(?:추가|등록|넣어)(?:줘|주세요|해줘|해주세요)?\s*$",
+        "", t, flags=re.IGNORECASE
+    )
+    t = re.sub(r"\s*(?:to[-\s]?do\s*(?:list)?|투두|할\s*일|리스트)\s*$", "", t, flags=re.IGNORECASE)
+    # 3. "업무/일정 추가해줘" → "업무/일정" 도 함께 제거 (단순 수식어인 경우)
+    t = re.sub(r"\s*(?:업무|일정)\s*(?:추가|등록|넣어)(?:줘|주세요|해줘|해주세요)\s*$", "", t, flags=re.IGNORECASE)
+    # 4. 순수 액션 동사 제거 ("추가해줘", "등록해줘", "넣어줘")
+    t = re.sub(r"\s*(?:추가|등록|넣어)(?:줘|주세요|해줘|해주세요)\s*$", "", t, flags=re.IGNORECASE)
+    # 5. 액션 동사 제거 후 남은 단독 "업무/일정" 접미사 제거
+    t = re.sub(r"\s+(?:업무|일정)\s*$", "", t)
+    return t.strip()
+
+
 def _quick_classify(text: str) -> tuple[str, dict] | None:
     """LLM 호출 전 명확한 패턴을 즉시 분류 (오분류 방지)"""
     if re.search(r"멀티.?에이전트|multi.?agent|run\.bat|PM\s*시작|서버\s*켜", text, re.IGNORECASE):
@@ -243,7 +269,14 @@ def _quick_classify(text: str) -> tuple[str, dict] | None:
     if re.search(r"매주|매달|매월|매일|정기\s*등록|자동\s*등록|반복\s*등록", text, re.IGNORECASE):
         if re.search(r"등록|추가|넣어|to.?do|할\s*일", text, re.IGNORECASE):
             return None  # LLM이 더 정확히 파싱
-    # "TO DO LIST 가져와" / "할 일 보여줘" / "내일 할 일" / "6월10일 업무" 등 → get_today_tasks
+    # 업무 추가 요청 — "추가/등록/넣어+줘" 로 끝나는 경우 add_task 우선 (get_today_tasks 오분류 방지)
+    # 단, "완료/미뤄/캘린더" 키워드가 있으면 패스
+    if not re.search(r"완료|했어|끝났어|미뤄|연기|캘린더", text, re.IGNORECASE):
+        if re.search(r"(?:추가|등록|넣어)(?:줘|주세요|해줘|해주세요)", text, re.IGNORECASE):
+            task_name = _extract_task_name(text)
+            if task_name:
+                return "add_task", {"task_name": task_name, "date": _parse_date_str(text)}
+    # "TO DO LIST 가져와" / "할 일 보여줘" / "내일 할 일" 등 → get_today_tasks
     if (
         re.search(r"(?:to[-\s]?do|투두|할\s*일).{0,25}(?:가져|불러|조회|보여|알려)", text, re.IGNORECASE)
         or re.search(r"(?:오늘|내일|모레|다음\s*주).{0,20}(?:to[-\s]?do|할\s*일|투두|업무|일정).{0,20}(?:list|리스트|목록|가져|보여)?", text, re.IGNORECASE)
@@ -318,6 +351,12 @@ def _normalize_date(val: str) -> str:
     if re.match(r"^\d{4}-\d{2}-\d{2}$", val):
         return val
     today = date.today()
+    # "today", "오늘" 처리
+    if val.strip().lower() in ("today", "오늘"):
+        return today.isoformat()
+    # "tomorrow", "내일"
+    if val.strip().lower() in ("tomorrow", "내일"):
+        return (today + timedelta(days=1)).isoformat()
     m = re.search(r"(\d{1,2})[월/](\d{1,2})", val)
     if m:
         mo, dy = int(m.group(1)), int(m.group(2))
@@ -357,13 +396,9 @@ def _regex_classify(text: str) -> tuple[str, dict]:
         title = re.sub(r"\d{1,2}[월/]\d{1,2}일?에?\s*", "", text)
         title = re.sub(r"캘린더에?\s*(?:추가|넣어|저장)해줘.*", "", title).strip()
         return "add_calendar_event", {"title": title, "date": _parse_date_str(text)}
-    if re.search(r"to-do|할\s*일|태스크|리스트", text, re.IGNORECASE) and re.search(r"추가|넣어|등록", text):
-        cleaned = re.sub(r"\d{1,2}[월/]\d{1,2}일?에?\s*", "", text)
-        cleaned = re.sub(
-            r"(?:to-do\s*(?:list)?|할\s*일|태스크|리스트)[에를]?\s*(?:추가|넣어|등록)해줘.*",
-            "", cleaned, flags=re.IGNORECASE
-        ).strip()
-        return "add_task", {"task_name": cleaned, "date": _parse_date_str(text)}
+    # add_task: "to-do/할 일" 키워드 없이 "추가/등록/넣어" 만으로도 인식
+    if re.search(r"추가|등록|넣어", text, re.IGNORECASE):
+        return "add_task", {"task_name": _extract_task_name(text), "date": _parse_date_str(text)}
     if (
         re.search(r"오늘.{0,15}(?:to[-\s]?do|할\s*일|투두|리스트|목록|업무|태스크)", text, re.IGNORECASE)
         or re.search(r"(?:to[-\s]?do|투두|할\s*일).{0,15}(?:가져|불러|조회|보여|알려)", text, re.IGNORECASE)
@@ -925,33 +960,8 @@ def workflow_task_add(say, task_name: str, event_date: str, user_id: str = ""):
     if not task_name:
         say("어떤 업무를 추가할까요?\n예: `@봇 마케팅 회의 to-do list에 추가해줘 6/5`")
         return
-
-    if user_id:
-        category_prop, categories = fetch_task_categories()
-        _pending_task_add[user_id] = {
-            "task_name": task_name,
-            "date": event_date,
-            "category_prop": category_prop,
-            "valid_categories": categories,
-        }
-        date_str = f" ({event_date})" if event_date else ""
-
-        if categories:
-            options_text = "  ".join(f"`{c}`" for c in categories)
-            msg = (
-                f"*'{task_name}'*{date_str}을(를) to-do 리스트에 추가할게요. ✍️\n\n"
-                f"어떤 항목의 업무인가요?\n{options_text}\n\n"
-                f"@봇 [항목명] 으로 답해주세요. 바로 추가: `@봇 바로추가`"
-            )
-        else:
-            msg = (
-                f"*'{task_name}'*{date_str}을(를) to-do 리스트에 추가할게요. ✍️\n\n"
-                f"어떤 항목의 업무인가요? _(예: 회의, 보고서, 개발, 마케팅, 운영 등)_\n"
-                f"@봇 [항목명] 으로 답해주세요. 바로 추가: `@봇 바로추가`"
-            )
-        say(msg)
-    else:
-        _execute_task_add(say, task_name, event_date, None, "", [])
+    # 카테고리 확인 없이 즉시 등록 (사용자 경험 개선)
+    _execute_task_add(say, task_name, event_date, None, "", [])
 
 
 def _execute_task_add(
