@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import uuid
 from collections import defaultdict
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -19,6 +20,14 @@ import requests
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    _scheduler = BackgroundScheduler(timezone="Asia/Seoul")
+    _HAS_SCHEDULER = True
+except ImportError:
+    _scheduler = None
+    _HAS_SCHEDULER = False
 
 load_dotenv()
 
@@ -166,6 +175,49 @@ _LLM_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "schedule_recurring_task",
+            "description": (
+                "매주/매달/매일 반복되는 업무를 Notion TO DO LIST에 자동 등록한다. "
+                "'매주 월요일 X 등록해줘', '매달 1일 Y 업무 추가', '매일 아침 Z 등록' 등 "
+                "정기·반복·자동 등록 요청일 때. "
+                "단순 일회성 업무 추가는 add_task를 사용한다."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_name": {
+                        "type": "string",
+                        "description": "정기 등록할 업무명",
+                    },
+                    "recurrence": {
+                        "type": "string",
+                        "enum": ["daily", "weekly", "monthly"],
+                        "description": "반복 주기: daily(매일)/weekly(매주)/monthly(매달)",
+                    },
+                    "day_of_week": {
+                        "type": "string",
+                        "description": "recurrence=weekly일 때 요일 영어 약자: mon/tue/wed/thu/fri/sat/sun. 한국어(월화수목금토일)를 변환하여 입력.",
+                    },
+                    "day_of_month": {
+                        "type": "integer",
+                        "description": "recurrence=monthly일 때 날짜(1~31)",
+                    },
+                },
+                "required": ["task_name", "recurrence"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_recurring_tasks",
+            "description": "등록된 정기 업무 자동 등록 목록을 조회한다. '정기 업무 목록', '자동 등록 목록' 등.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "unknown",
             "description": "요청을 이해하지 못했거나 위 기능에 해당하지 않는 요청.",
             "parameters": {
@@ -184,6 +236,13 @@ def _quick_classify(text: str) -> tuple[str, dict] | None:
     """LLM 호출 전 명확한 패턴을 즉시 분류 (오분류 방지)"""
     if re.search(r"멀티.?에이전트|multi.?agent|run\.bat|PM\s*시작|서버\s*켜", text, re.IGNORECASE):
         return "run_bat", {"target": "multi_agent"}
+    # 정기 업무 목록 조회
+    if re.search(r"정기\s*업무\s*목록|자동\s*등록\s*목록|반복\s*업무\s*목록", text, re.IGNORECASE):
+        return "list_recurring_tasks", {}
+    # "매주/매달/매일 + 등록/추가" → schedule_recurring_task (LLM에 위임)
+    if re.search(r"매주|매달|매월|매일|정기\s*등록|자동\s*등록|반복\s*등록", text, re.IGNORECASE):
+        if re.search(r"등록|추가|넣어|to.?do|할\s*일", text, re.IGNORECASE):
+            return None  # LLM이 더 정확히 파싱
     # "TO DO LIST 가져와" / "할 일 보여줘" / "내일 할 일" / "6월10일 업무" 등 → get_today_tasks
     if (
         re.search(r"(?:to[-\s]?do|투두|할\s*일).{0,25}(?:가져|불러|조회|보여|알려)", text, re.IGNORECASE)
@@ -274,6 +333,18 @@ def _regex_classify(text: str) -> tuple[str, dict]:
     """폴백: 정규식 기반 분류"""
     if re.search(r"멀티.?에이전트|multi.?agent|run\.bat|PM\s*시작|서버\s*켜", text, re.IGNORECASE):
         return "run_bat", {"target": "multi_agent"}
+    if re.search(r"정기\s*업무\s*목록|자동\s*등록\s*목록|반복\s*업무\s*목록", text, re.IGNORECASE):
+        return "list_recurring_tasks", {}
+    if re.search(r"매주|매달|매월|매일", text, re.IGNORECASE) and re.search(r"등록|추가|넣어", text, re.IGNORECASE):
+        dow = _parse_day_of_week(text)
+        recurrence = "weekly" if re.search(r"매주", text) else ("monthly" if re.search(r"매달|매월", text) else "daily")
+        dom_m = re.search(r"(\d+)\s*일", text)
+        return "schedule_recurring_task", {
+            "task_name": "",
+            "recurrence": recurrence,
+            "day_of_week": dow or "",
+            "day_of_month": int(dom_m.group(1)) if dom_m and recurrence == "monthly" else 0,
+        }
     if re.search(r"패턴\s*갱신|캐시\s*삭제|다시\s*분석", text):
         return "reset_cache", {}
     if re.search(r"완료|했어|끝났어|했다|마쳤어", text):
@@ -537,6 +608,186 @@ def build_briefing(tasks: list[dict]) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
+# 정기 업무 스케줄러
+# ──────────────────────────────────────────────────────────────
+
+_DOW_MAP = {
+    "월": "mon", "월요일": "mon",
+    "화": "tue", "화요일": "tue",
+    "수": "wed", "수요일": "wed",
+    "목": "thu", "목요일": "thu",
+    "금": "fri", "금요일": "fri",
+    "토": "sat", "토요일": "sat",
+    "일": "sun", "일요일": "sun",
+    "mon": "mon", "tue": "tue", "wed": "wed", "thu": "thu",
+    "fri": "fri", "sat": "sat", "sun": "sun",
+}
+_DOW_KR = {
+    "mon": "월요일", "tue": "화요일", "wed": "수요일",
+    "thu": "목요일", "fri": "금요일", "sat": "토요일", "sun": "일요일",
+}
+_RECURRENCE_KR = {"daily": "매일", "weekly": "매주", "monthly": "매달"}
+
+_SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")
+
+
+def _parse_day_of_week(text: str) -> str:
+    for kr, en in _DOW_MAP.items():
+        if kr in text:
+            return en
+    return ""
+
+
+def _load_recurring_tasks() -> list[dict]:
+    path = OUTPUT_DIR / "recurring_tasks.json"
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _save_recurring_tasks(tasks: list[dict]):
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    (OUTPUT_DIR / "recurring_tasks.json").write_text(
+        json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _notify_slack(text: str):
+    """스케줄러에서 Slack 채널에 메시지 전송"""
+    if not _SLACK_CHANNEL_ID:
+        return
+    try:
+        app.client.chat_postMessage(channel=_SLACK_CHANNEL_ID, text=text)
+    except Exception as e:
+        print(f"[스케줄러] Slack 알림 실패: {e}", file=sys.stderr)
+
+
+def _scheduled_add_task(task_name: str):
+    """APScheduler가 호출하는 Notion 자동 등록 함수"""
+    today = date.today().isoformat()
+    print(f"[스케줄러] '{task_name}' 자동 등록 시작 ({today})")
+    try:
+        resp = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=_NOTION_HEADERS,
+            json={
+                "parent": {"database_id": _NOTION_TASK_DB_ID},
+                "properties": {
+                    "이름": {"title": [{"text": {"content": task_name}}]},
+                    "날짜": {"date": {"start": today}},
+                },
+            },
+            verify=False,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        _notify_slack(f"📋 *정기 업무 자동 등록*: _{task_name}_ ({today})")
+        print(f"[스케줄러] '{task_name}' 등록 완료")
+    except Exception as e:
+        print(f"[스케줄러] '{task_name}' 등록 실패: {e}", file=sys.stderr)
+        _notify_slack(f"⚠️ 정기 업무 자동 등록 실패: _{task_name}_\n`{e}`")
+
+
+def _register_scheduler_job(task: dict):
+    if not _HAS_SCHEDULER:
+        return
+    job_id = task["job_id"]
+    task_name = task["task_name"]
+    recurrence = task["recurrence"]
+    try:
+        if recurrence == "daily":
+            _scheduler.add_job(
+                _scheduled_add_task, "cron", hour=9, minute=0,
+                args=[task_name], id=job_id, replace_existing=True,
+            )
+        elif recurrence == "weekly":
+            dow = task.get("day_of_week", "mon")
+            _scheduler.add_job(
+                _scheduled_add_task, "cron", day_of_week=dow, hour=9, minute=0,
+                args=[task_name], id=job_id, replace_existing=True,
+            )
+        elif recurrence == "monthly":
+            dom = task.get("day_of_month") or 1
+            _scheduler.add_job(
+                _scheduled_add_task, "cron", day=dom, hour=9, minute=0,
+                args=[task_name], id=job_id, replace_existing=True,
+            )
+        print(f"[스케줄러] job 등록: '{task_name}' ({recurrence})")
+    except Exception as e:
+        print(f"[스케줄러] job 등록 실패: {e}", file=sys.stderr)
+
+
+def _check_recurring_missing(info: dict) -> dict | None:
+    """schedule_recurring_task에서 누락된 필드 반환. 없으면 None."""
+    if not info.get("task_name", "").strip():
+        return {"missing_field": "task_name", "question": "어떤 업무를 정기 등록할까요?\n업무명을 알려주세요."}
+    if not info.get("recurrence"):
+        return {"missing_field": "recurrence", "question": "매주, 매달, 매일 중 어떤 주기로 등록할까요?"}
+    if info.get("recurrence") == "weekly" and not info.get("day_of_week"):
+        return {
+            "missing_field": "day_of_week",
+            "question": "매주 무슨 요일에 등록할까요?\n(예: 월요일, 화요일, 수요일, 목요일, 금요일)",
+        }
+    if info.get("recurrence") == "monthly" and not info.get("day_of_month"):
+        return {"missing_field": "day_of_month", "question": "매월 며칠에 등록할까요? (예: 1, 15, 25)"}
+    return None
+
+
+def workflow_schedule_recurring_task(
+    say, task_name: str, recurrence: str,
+    day_of_week: str = "", day_of_month: int = 0, user_id: str = "",
+):
+    job_id = f"recurring_{uuid.uuid4().hex[:8]}"
+    task = {
+        "job_id": job_id,
+        "task_name": task_name.strip(),
+        "recurrence": recurrence,
+        "day_of_week": day_of_week.lower(),
+        "day_of_month": int(day_of_month) if day_of_month else 0,
+        "created_at": datetime.now().isoformat(),
+    }
+    existing = _load_recurring_tasks()
+    existing.append(task)
+    _save_recurring_tasks(existing)
+    _register_scheduler_job(task)
+
+    if recurrence == "weekly":
+        dow_kr = _DOW_KR.get(day_of_week.lower(), day_of_week)
+        schedule_str = f"매주 *{dow_kr}*"
+    elif recurrence == "monthly":
+        schedule_str = f"매달 *{day_of_month}일*"
+    else:
+        schedule_str = "매일"
+
+    say(
+        f"✅ *'{task_name}'* 업무를 {schedule_str} 오전 9시에 TO DO LIST에 자동 등록합니다.\n"
+        f"등록된 정기 업무 전체 목록: `@봇 정기 업무 목록`"
+    )
+
+
+def workflow_list_recurring_tasks(say):
+    tasks = _load_recurring_tasks()
+    if not tasks:
+        say("📋 등록된 정기 자동 업무가 없습니다.")
+        return
+    lines = [f"🔄 *정기 자동 등록 업무 목록* ({len(tasks)}건)\n"]
+    for t in tasks:
+        rec = t.get("recurrence", "")
+        if rec == "weekly":
+            dow_kr = _DOW_KR.get(t.get("day_of_week", ""), t.get("day_of_week", ""))
+            sched = f"매주 {dow_kr}"
+        elif rec == "monthly":
+            sched = f"매달 {t.get('day_of_month', '?')}일"
+        else:
+            sched = "매일"
+        lines.append(f"• *{t['task_name']}* — {sched} 오전 9시")
+    say("\n".join(lines))
+
+
+# ──────────────────────────────────────────────────────────────
 # 태스크 추가 — 카테고리 확인 대기 상태
 # ──────────────────────────────────────────────────────────────
 
@@ -545,6 +796,9 @@ _pending_task_add: dict[str, dict] = {}
 
 # user_id → {action, task_name, new_date}
 _pending_confirmation: dict[str, dict] = {}
+
+# user_id → {intent, info, missing_field, question}
+_pending_clarification: dict[str, dict] = {}
 
 _NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 _NOTION_TASK_DB_ID = os.environ.get("NOTION_TASK_DB_ID", "")
@@ -920,7 +1174,25 @@ def _do_postpone(say, task_name: str, new_date: str):
 
 def workflow_postpone(say, task_name: str, new_date: str, user_id: str = ""):
     if not task_name:
-        say("어떤 업무를 연기할까요?\n예: `@봇 주간보고 다음 주로 미뤄`")
+        if user_id:
+            _pending_clarification[user_id] = {
+                "intent": "postpone_task",
+                "info": {"task_name": "", "new_date": new_date},
+                "missing_field": "task_name",
+                "question": "어떤 업무를 연기할까요?",
+            }
+            say("어떤 업무를 연기할까요?")
+        else:
+            say("어떤 업무를 연기할까요?\n예: `@봇 주간보고 다음 주로 미뤄`")
+        return
+    if not new_date and user_id:
+        _pending_clarification[user_id] = {
+            "intent": "postpone_task",
+            "info": {"task_name": task_name, "new_date": ""},
+            "missing_field": "new_date",
+            "question": f"*'{task_name}'* 을(를) 언제로 미룰까요?\n예: `내일`, `다음주 월요일`, `6월 15일`",
+        }
+        say(f"*'{task_name}'* 을(를) 언제로 미룰까요?\n예: `내일`, `다음주 월요일`, `6월 15일`")
         return
     if user_id:
         _pending_confirmation[user_id] = {
@@ -956,6 +1228,60 @@ def handle_mention(event, say):
             user_text,
             pending.get("valid_categories", []),
         )
+        return
+
+    # 누락 정보 보완 대기 중이면 현재 메시지로 빈 필드를 채움
+    if user_id and user_id in _pending_clarification:
+        pending = _pending_clarification.pop(user_id)
+        intent = pending["intent"]
+        info = pending["info"]
+        missing_field = pending["missing_field"]
+        print(f"  → 보완 답변 수신: '{user_text}' / field={missing_field}")
+
+        if missing_field == "task_name":
+            info["task_name"] = user_text.strip()
+        elif missing_field == "recurrence":
+            if re.search(r"매주|주간|weekly", user_text, re.IGNORECASE):
+                info["recurrence"] = "weekly"
+            elif re.search(r"매달|매월|monthly|월간", user_text, re.IGNORECASE):
+                info["recurrence"] = "monthly"
+            elif re.search(r"매일|daily", user_text, re.IGNORECASE):
+                info["recurrence"] = "daily"
+            else:
+                _pending_clarification[user_id] = pending
+                say("매주, 매달, 매일 중 하나로 알려주세요.")
+                return
+        elif missing_field == "day_of_week":
+            dow = _parse_day_of_week(user_text)
+            if dow:
+                info["day_of_week"] = dow
+            else:
+                _pending_clarification[user_id] = pending
+                say("요일을 알려주세요. (예: 월요일, 화요일, 수요일, 목요일, 금요일)")
+                return
+        elif missing_field == "day_of_month":
+            m = re.search(r"\d+", user_text)
+            if m:
+                info["day_of_month"] = int(m.group())
+            else:
+                _pending_clarification[user_id] = pending
+                say("숫자로 날짜를 알려주세요. (예: 1, 15, 25)")
+                return
+        elif missing_field == "new_date":
+            parsed = _parse_date_str(user_text)
+            info["new_date"] = parsed if parsed else user_text.strip()
+
+        # schedule_recurring_task: 아직 빠진 필드 있으면 재질문
+        if intent == "schedule_recurring_task":
+            still_missing = _check_recurring_missing(info)
+            if still_missing:
+                _pending_clarification[user_id] = {
+                    "intent": intent, "info": info, **still_missing
+                }
+                say(still_missing["question"])
+                return
+
+        _dispatch_intent(say, intent, info, user_id)
         return
 
     # 완료·연기 확인 대기 중이면 현재 메시지를 확인 답변으로 처리
@@ -1024,6 +1350,27 @@ def _dispatch_intent(say, intent: str, info: dict, user_id: str = ""):
     elif intent == "add_task":
         workflow_task_add(say, info.get("task_name", ""), info.get("date", ""), user_id)
 
+    elif intent == "schedule_recurring_task":
+        # 누락 필드 있으면 먼저 질문
+        missing = _check_recurring_missing(info)
+        if missing and user_id:
+            _pending_clarification[user_id] = {
+                "intent": intent, "info": info, **missing
+            }
+            say(missing["question"])
+        else:
+            workflow_schedule_recurring_task(
+                say,
+                task_name=info.get("task_name", ""),
+                recurrence=info.get("recurrence", ""),
+                day_of_week=info.get("day_of_week", ""),
+                day_of_month=info.get("day_of_month", 0),
+                user_id=user_id,
+            )
+
+    elif intent == "list_recurring_tasks":
+        workflow_list_recurring_tasks(say)
+
     elif intent == "unknown":
         say(info.get("message", "요청을 이해하지 못했습니다. 다시 말씀해 주세요."))
 
@@ -1031,6 +1378,8 @@ def _dispatch_intent(say, intent: str, info: dict, user_id: str = ""):
         say(
             "요청을 이해하지 못했습니다.\n\n사용 가능한 명령:\n"
             "• `@봇 [업무명] to-do에 추가해줘` — 업무 추가\n"
+            "• `@봇 매주 월요일 [업무명] 등록해줘` — 정기 업무 자동 등록\n"
+            "• `@봇 정기 업무 목록` — 정기 업무 확인\n"
             "• `@봇 [업무명] 완료했어` — 완료 처리\n"
             "• `@봇 [업무명] 미뤄 [날짜]` — 연기\n"
             "• `@봇 [업무명] 캘린더에 추가 [날짜]` — 캘린더 추가\n"
@@ -1051,6 +1400,20 @@ if __name__ == "__main__":
         sys.exit(1)
 
     OUTPUT_DIR.mkdir(exist_ok=True)
+
+    # APScheduler 시작 및 기존 정기 업무 복원
+    if _HAS_SCHEDULER:
+        _scheduler.start()
+        existing_recurring = _load_recurring_tasks()
+        if existing_recurring:
+            for t in existing_recurring:
+                _register_scheduler_job(t)
+            print(f"[스케줄러] 정기 업무 {len(existing_recurring)}건 복원 완료")
+        else:
+            print("[스케줄러] 등록된 정기 업무 없음")
+    else:
+        print("[스케줄러] APScheduler 없음 — pip install apscheduler")
+
     print("=" * 50)
     print("업무비서 리스너 시작")
     print(f"출력 경로: {OUTPUT_DIR}")
