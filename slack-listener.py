@@ -830,8 +830,31 @@ def workflow_schedule_recurring_task(
     else:
         schedule_str = "매일"
 
+    # 정기 업무 등록 즉시 Notion에도 오늘 날짜로 한 번 추가 (즉각적 확인 가능)
+    today = date.today().isoformat()
+    try:
+        resp = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers=_NOTION_HEADERS,
+            json={
+                "parent": {"database_id": _NOTION_TASK_DB_ID},
+                "properties": {
+                    "이름": {"title": [{"text": {"content": task_name.strip()}}]},
+                    "날짜": {"date": {"start": today}},
+                },
+            },
+            verify=False,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        notion_ok = True
+    except Exception as e:
+        print(f"[정기업무] 즉시 등록 실패: {e}", file=sys.stderr)
+        notion_ok = False
+
+    notion_note = f"\n📋 오늘({today}) Notion에 첫 번째 항목을 등록했습니다." if notion_ok else ""
     say(
-        f"✅ *'{task_name}'* 업무를 {schedule_str} 오전 9시에 TO DO LIST에 자동 등록합니다.\n"
+        f"✅ *'{task_name}'* 업무를 {schedule_str} 오전 9시에 TO DO LIST에 자동 등록합니다.{notion_note}\n"
         f"등록된 정기 업무 전체 목록: `@봇 정기 업무 목록`"
     )
 
