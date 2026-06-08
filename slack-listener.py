@@ -265,10 +265,24 @@ def _quick_classify(text: str) -> tuple[str, dict] | None:
     # 정기 업무 목록 조회
     if re.search(r"정기\s*업무\s*목록|자동\s*등록\s*목록|반복\s*업무\s*목록", text, re.IGNORECASE):
         return "list_recurring_tasks", {}
-    # "매주/매달/매일 + 등록/추가" → schedule_recurring_task (LLM에 위임)
+    # "매주/매달/매일 + 등록/추가" → schedule_recurring_task (regex 직접 처리, LLM보다 정확)
     if re.search(r"매주|매달|매월|매일|정기\s*등록|자동\s*등록|반복\s*등록", text, re.IGNORECASE):
         if re.search(r"등록|추가|넣어|to.?do|할\s*일", text, re.IGNORECASE):
-            return None  # LLM이 더 정확히 파싱
+            recurrence = (
+                "weekly" if re.search(r"매주", text)
+                else "monthly" if re.search(r"매달|매월", text)
+                else "daily"
+            )
+            dow = _parse_day_of_week(text)
+            dom_m = re.search(r"(\d+)\s*일", text)
+            day_of_month = int(dom_m.group(1)) if dom_m and recurrence == "monthly" else 0
+            task_name = _extract_recurring_task_name(text)
+            return "schedule_recurring_task", {
+                "task_name": task_name,
+                "recurrence": recurrence,
+                "day_of_week": dow,
+                "day_of_month": day_of_month,
+            }
     # 업무 추가 요청 — "추가/등록/넣어+줘" 로 끝나는 경우 add_task 우선 (get_today_tasks 오분류 방지)
     # 단, "완료/미뤄/캘린더" 키워드가 있으면 패스
     if not re.search(r"완료|했어|끝났어|미뤄|연기|캘린더", text, re.IGNORECASE):
@@ -375,13 +389,13 @@ def _regex_classify(text: str) -> tuple[str, dict]:
     if re.search(r"정기\s*업무\s*목록|자동\s*등록\s*목록|반복\s*업무\s*목록", text, re.IGNORECASE):
         return "list_recurring_tasks", {}
     if re.search(r"매주|매달|매월|매일", text, re.IGNORECASE) and re.search(r"등록|추가|넣어", text, re.IGNORECASE):
-        dow = _parse_day_of_week(text)
         recurrence = "weekly" if re.search(r"매주", text) else ("monthly" if re.search(r"매달|매월", text) else "daily")
+        dow = _parse_day_of_week(text)
         dom_m = re.search(r"(\d+)\s*일", text)
         return "schedule_recurring_task", {
-            "task_name": "",
+            "task_name": _extract_recurring_task_name(text),
             "recurrence": recurrence,
-            "day_of_week": dow or "",
+            "day_of_week": dow,
             "day_of_month": int(dom_m.group(1)) if dom_m and recurrence == "monthly" else 0,
         }
     if re.search(r"패턴\s*갱신|캐시\s*삭제|다시\s*분석", text):
@@ -666,10 +680,29 @@ _RECURRENCE_KR = {"daily": "매일", "weekly": "매주", "monthly": "매달"}
 _SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")
 
 
+def _extract_recurring_task_name(text: str) -> str:
+    """정기 등록 요청 텍스트에서 업무명 추출"""
+    t = text
+    t = re.sub(r"매주|매달|매월|매일", "", t)
+    t = re.sub(r"[월화수목금토일]요일?", "", t)
+    t = re.sub(r"\d{1,2}\s*일", "", t)
+    t = re.sub(
+        r"\s*(?:to[-\s]?do\s*(?:list)?|투두|할\s*일|리스트)\s*에?\s*(?:추가|등록|넣어)(?:줘|주세요|해줘|해주세요)?\s*$",
+        "", t, flags=re.IGNORECASE
+    )
+    t = re.sub(r"\s*(?:추가|등록|넣어)(?:줘|주세요|해줘|해주세요)\s*$", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+(?:업무|일정)\s*$", "", t)
+    return t.strip()
+
+
 def _parse_day_of_week(text: str) -> str:
-    for kr, en in _DOW_MAP.items():
-        if kr in text:
-            return en
+    # "N일"(날짜), "매일"(매일 반복)은 요일이 아니므로 제거
+    cleaned = re.sub(r"\d+\s*일", "", text)
+    cleaned = re.sub(r"매일", "", cleaned)
+    # 긴 패턴부터 먼저 검색 (예: "월요일" → "월" 보다 먼저)
+    for kr in sorted(_DOW_MAP, key=len, reverse=True):
+        if kr in cleaned:
+            return _DOW_MAP[kr]
     return ""
 
 
